@@ -1,0 +1,21 @@
+# Strategy parameters (tunable)
+
+risk:
+  risk_percent: 0.01
+  atr_multiplier: 2.0
+  reward_risk_ratio: 2.0
+
+indicators:
+  atr_period: 14
+  atr_ma_period: 14
+  obv_ma_period: 10
+  pivot_lookback: 2
+
+liquidity:
+  tolerance: 0.001
+  lookback: 5
+
+order_blocks:
+  impulse_factor: 1.5
+  lookback: 50
+  max_base_candles: 3

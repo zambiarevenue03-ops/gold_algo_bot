@@ -1,0 +1,14 @@
+# Global settings (backtesting only)
+
+symbol: XAUUSD
+base_timeframe: 1H
+htf_timeframes:
+  - 4H
+  - 1D
+
+initial_balance: 10000
+commission: 0.0002
+
+logging:
+  enabled: true
+  log_level: INFO

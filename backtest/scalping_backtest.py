@@ -44,7 +44,6 @@ from scalping.risk_model   import (
     ScalpRiskParams, build_trade_parameters,
     DailyRiskGuard, DEFAULT_PARAMS,
 )
-from scalping.trailing_stop import TrailingStopManager
 
 
 # ── backtest configuration ─────────────────────────────────────────────────────
@@ -112,7 +111,9 @@ def _simulate_trade(
 ) -> dict:
     """
     Walk forward from entry_bar to find SL or TP hits.
-    NOW WITH TRAILING STOP SUPPORT.
+    
+    Returns a result dict with outcome details.
+    Partial exits are modelled: 50% at TP1, 30% at TP2, 20% at TP3/SL.
     """
     signal   = trade["signal"]
     entry    = trade["entry"] + params.spread_points + params.slippage_points
@@ -120,80 +121,119 @@ def _simulate_trade(
     tp1, tp2, tp3 = trade["tp1"], trade["tp2"], trade["tp3"]
     lot      = trade["lot_size"]
     risk     = trade["risk"]
+
+    tp1_pct, tp2_pct, tp3_pct = trade["tp1_pct"], trade["tp2_pct"], trade["tp3_pct"]
     pip      = params.risk_params.pip_size
     pv       = params.risk_params.point_value
 
-    # Initialize trailing stop manager
-    manager = TrailingStopManager(
-        signal=signal, entry_price=entry, stop_loss=sl,
-        tp1=tp1, tp2=tp2, tp3=tp3, trail_distance_atr=0.5
-    )
+    # Track state
+    tp1_hit = tp2_hit = False
+    remaining_lot = lot
+    total_pnl = 0.0
+    exit_bar  = entry_bar
+    exit_price = entry
+    outcome   = "open"
 
-    # Calculate ATR for trailing
-    atr_series = df_15m['high'].rolling(14).max() - df_15m['low'].rolling(14).min()
-    atr_val = float(atr_series.iloc[entry_bar]) / 4 if entry_bar < len(atr_series) else 8.0
-
-    exit_bar = entry_bar
     future = df_15m.iloc[entry_bar + 1:]
 
     for i, (ts, row) in enumerate(future.iterrows()):
         bar_high = row["high"]
         bar_low  = row["low"]
 
-        # Update trailing stop
-        check_price = bar_high if signal == "long" else bar_low
-        new_sl = manager.update(check_price, atr_val, ts)
+        if signal == "long":
+            # Check TP1
+            if not tp1_hit and bar_high >= tp1:
+                lot1 = round(lot * tp1_pct, 2)
+                pnl1 = (tp1 - entry) / pip * pv * lot1
+                total_pnl    += pnl1
+                remaining_lot = round(remaining_lot - lot1, 2)
+                tp1_hit       = True
 
-        # Check if stopped out
-        if signal == "long" and bar_low <= new_sl:
-            exit_bar = entry_bar + 1 + i
-            break
-        elif signal == "short" and bar_high >= new_sl:
-            exit_bar = entry_bar + 1 + i
-            break
+            # Check TP2
+            if tp1_hit and not tp2_hit and bar_high >= tp2:
+                lot2 = round(lot * tp2_pct, 2)
+                pnl2 = (tp2 - entry) / pip * pv * lot2
+                total_pnl    += pnl2
+                remaining_lot = round(remaining_lot - lot2, 2)
+                tp2_hit       = True
 
-        # Check if TP3 hit (full exit)
-        if manager.tp3_hit:
-            exit_bar = entry_bar + 1 + i
-            break
+            # Check TP3 / runner exit
+            if tp2_hit and bar_high >= tp3:
+                pnl3 = (tp3 - entry) / pip * pv * remaining_lot
+                total_pnl += pnl3
+                exit_bar   = entry_bar + 1 + i
+                exit_price = tp3
+                outcome    = "tp3"
+                break
+
+            # Check SL
+            if bar_low <= sl:
+                exit_price = sl
+                if tp1_hit:
+                    # SL hit after TP1 — partial win
+                    pnl_sl = (sl - entry) / pip * pv * remaining_lot
+                    total_pnl += pnl_sl
+                    outcome = "sl_after_tp1" if not tp2_hit else "sl_after_tp2"
+                else:
+                    # Full loss
+                    pnl_sl = (sl - entry) / pip * pv * lot
+                    total_pnl = pnl_sl
+                    outcome = "sl"
+                exit_bar = entry_bar + 1 + i
+                break
+
+        else:  # short
+            if not tp1_hit and bar_low <= tp1:
+                lot1 = round(lot * tp1_pct, 2)
+                pnl1 = (entry - tp1) / pip * pv * lot1
+                total_pnl    += pnl1
+                remaining_lot = round(remaining_lot - lot1, 2)
+                tp1_hit       = True
+
+            if tp1_hit and not tp2_hit and bar_low <= tp2:
+                lot2 = round(lot * tp2_pct, 2)
+                pnl2 = (entry - tp2) / pip * pv * lot2
+                total_pnl    += pnl2
+                remaining_lot = round(remaining_lot - lot2, 2)
+                tp2_hit       = True
+
+            if tp2_hit and bar_low <= tp3:
+                pnl3 = (entry - tp3) / pip * pv * remaining_lot
+                total_pnl += pnl3
+                exit_bar   = entry_bar + 1 + i
+                exit_price = tp3
+                outcome    = "tp3"
+                break
+
+            if bar_high >= sl:
+                exit_price = sl
+                if tp1_hit:
+                    pnl_sl = (entry - sl) / pip * pv * remaining_lot
+                    total_pnl += pnl_sl
+                    outcome = "sl_after_tp1" if not tp2_hit else "sl_after_tp2"
+                else:
+                    pnl_sl = (entry - sl) / pip * pv * lot
+                    total_pnl = pnl_sl
+                    outcome = "sl"
+                exit_bar = entry_bar + 1 + i
+                break
     else:
-        # Reached end of data
-        exit_bar = len(df_15m) - 1
-
-    # Calculate P&L from partial exits
-    total_pnl = 0.0
-    for exit_price, pct, _ in manager.exits:
+        # Reached end of data without resolution
+        last_close = future["close"].iloc[-1] if len(future) > 0 else entry
         if signal == "long":
-            pips = (exit_price - entry) / pip
+            total_pnl = (last_close - entry) / pip * pv * remaining_lot
         else:
-            pips = (entry - exit_price) / pip
-        total_pnl += pips * pv * lot * pct
-
-    # Add remaining position P&L
-    if manager.remaining_position_pct > 0:
-        final_exit = manager.current_sl
-        if signal == "long":
-            pips = (final_exit - entry) / pip
-        else:
-            pips = (entry - final_exit) / pip
-        total_pnl += pips * pv * lot * manager.remaining_position_pct
+            total_pnl = (entry - last_close) / pip * pv * remaining_lot
+        exit_bar   = len(df_15m) - 1
+        exit_price = last_close
+        outcome    = "end_of_data"
 
     # Commission
     commission = params.commission_per_lot * lot
-    net_pnl = total_pnl - commission
-
-    # Determine outcome
-    if manager.tp3_hit:
-        outcome = "tp3"
-    elif manager.tp2_hit:
-        outcome = "trail_sl" if manager.remaining_position_pct == 0 else "sl_after_tp2"
-    elif manager.tp1_hit:
-        outcome = "sl_after_tp1"
-    else:
-        outcome = "sl"
+    net_pnl    = total_pnl - commission
 
     # R-multiple
-    risk_usd = (risk / pip) * pv * lot
+    risk_usd   = (risk / pip) * pv * lot
     r_multiple = net_pnl / risk_usd if risk_usd > 0 else 0.0
 
     return {
@@ -202,12 +242,11 @@ def _simulate_trade(
         "gross_pnl":  round(total_pnl, 2),
         "commission": round(commission, 2),
         "r_multiple": round(r_multiple, 3),
-        "tp1_hit":    manager.tp1_hit,
-        "tp2_hit":    manager.tp2_hit,
-        "exit_price": round(manager.current_sl, 2),
+        "tp1_hit":    tp1_hit,
+        "tp2_hit":    tp2_hit,
+        "exit_price": round(exit_price, 2),
         "exit_bar":   exit_bar,
         "bars_held":  exit_bar - entry_bar,
-        "trail_activated": manager.tp2_hit,
     }
 
 

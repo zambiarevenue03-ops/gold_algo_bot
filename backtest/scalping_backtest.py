@@ -1,33 +1,14 @@
 """
 backtest/scalping_backtest.py
 ==============================
-Backtesting engine for the XAUUSD scalping bot.
+Backtesting engine for the XAUUSD scalping bot with 2:1 R:R minimum.
 
-How it works:
-  1. Walk forward candle-by-candle through 15M data
-  2. At each candle, build 4H and 1H slices (resampled from 15M)
-  3. Call check_entry_signal_detailed() — the same function live trading uses
-  4. On signal: build trade parameters, then scan FORWARD for SL/TP hits
-  5. Record every trade outcome to a detailed journal
-
-Output metrics:
-  - Win rate, expectancy, avg R, max drawdown
-  - Rejection reason frequency table (shows what's blocking signals)
-  - Equity curve data
-  - Per-trade CSV journal
-
-Design principles:
-  - Zero lookahead bias: at bar[i], only data up to bar[i] is used
-  - Signal spacing: minimum gap between consecutive entries
-  - Daily risk guard: same kill switches as live trading
-  - Regime awareness: results split by date ranges
-
-Usage:
-    from backtest.scalping_backtest import ScalpBacktest, BacktestParams
-    bt = ScalpBacktest(df_15m, params=BacktestParams())
-    results = bt.run()
-    bt.print_summary(results)
-    bt.save_journal(results, "backtest/results/scalp_journal.csv")
+CHANGES FROM ORIGINAL:
+- TP1 at 2.0R (was 1.5R)
+- TP2 at 3.0R (was 2.5R)  
+- TP3 removed (was 4.0R)
+- 50/50 split (was 50/30/20)
+- Profit lock: After TP1 hits, SL moves to +1R (guarantees minimum 1.5R if reverses)
 """
 
 import pandas as pd
@@ -112,22 +93,28 @@ def _simulate_trade(
     """
     Walk forward from entry_bar to find SL or TP hits.
     
-    Returns a result dict with outcome details.
-    Partial exits are modelled: 50% at TP1, 30% at TP2, 20% at TP3/SL.
+    NEW: 2:1 R:R with profit lock
+    - TP1 at 2.0R (close 50%)
+    - TP2 at 3.0R (close 50%)
+    - After TP1: SL moves to +1R (lock profit)
+    
+    Worst case after TP1: +1.5R total
+    Best case: +2.5R total
     """
     signal   = trade["signal"]
     entry    = trade["entry"] + params.spread_points + params.slippage_points
-    sl       = trade["stop_loss"]
-    tp1, tp2, tp3 = trade["tp1"], trade["tp2"], trade["tp3"]
+    original_sl = trade["stop_loss"]
+    sl       = original_sl  # Will be modified after TP1
+    tp1, tp2 = trade["tp1"], trade["tp2"]
     lot      = trade["lot_size"]
     risk     = trade["risk"]
 
-    tp1_pct, tp2_pct, tp3_pct = trade["tp1_pct"], trade["tp2_pct"], trade["tp3_pct"]
+    tp1_pct, tp2_pct = trade["tp1_pct"], trade["tp2_pct"]
     pip      = params.risk_params.pip_size
     pv       = params.risk_params.point_value
 
     # Track state
-    tp1_hit = tp2_hit = False
+    tp1_hit = False
     remaining_lot = lot
     total_pnl = 0.0
     exit_bar  = entry_bar
@@ -148,34 +135,29 @@ def _simulate_trade(
                 total_pnl    += pnl1
                 remaining_lot = round(remaining_lot - lot1, 2)
                 tp1_hit       = True
+                
+                # PROFIT LOCK: Move SL to +1R after TP1 hits
+                sl = entry + risk  # Lock in +1R profit
 
             # Check TP2
-            if tp1_hit and not tp2_hit and bar_high >= tp2:
-                lot2 = round(lot * tp2_pct, 2)
-                pnl2 = (tp2 - entry) / pip * pv * lot2
-                total_pnl    += pnl2
-                remaining_lot = round(remaining_lot - lot2, 2)
-                tp2_hit       = True
-
-            # Check TP3 / runner exit
-            if tp2_hit and bar_high >= tp3:
-                pnl3 = (tp3 - entry) / pip * pv * remaining_lot
-                total_pnl += pnl3
+            if tp1_hit and bar_high >= tp2:
+                pnl2 = (tp2 - entry) / pip * pv * remaining_lot
+                total_pnl += pnl2
                 exit_bar   = entry_bar + 1 + i
-                exit_price = tp3
-                outcome    = "tp3"
+                exit_price = tp2
+                outcome    = "tp2"
                 break
 
             # Check SL
             if bar_low <= sl:
                 exit_price = sl
                 if tp1_hit:
-                    # SL hit after TP1 — partial win
+                    # SL at +1R after TP1 = partial win
                     pnl_sl = (sl - entry) / pip * pv * remaining_lot
                     total_pnl += pnl_sl
-                    outcome = "sl_after_tp1" if not tp2_hit else "sl_after_tp2"
+                    outcome = "sl_after_tp1"
                 else:
-                    # Full loss
+                    # Full loss (TP1 never hit)
                     pnl_sl = (sl - entry) / pip * pv * lot
                     total_pnl = pnl_sl
                     outcome = "sl"
@@ -183,35 +165,36 @@ def _simulate_trade(
                 break
 
         else:  # short
+            # Check TP1
             if not tp1_hit and bar_low <= tp1:
                 lot1 = round(lot * tp1_pct, 2)
                 pnl1 = (entry - tp1) / pip * pv * lot1
                 total_pnl    += pnl1
                 remaining_lot = round(remaining_lot - lot1, 2)
                 tp1_hit       = True
+                
+                # PROFIT LOCK: Move SL to -1R after TP1 hits
+                sl = entry - risk
 
-            if tp1_hit and not tp2_hit and bar_low <= tp2:
-                lot2 = round(lot * tp2_pct, 2)
-                pnl2 = (entry - tp2) / pip * pv * lot2
-                total_pnl    += pnl2
-                remaining_lot = round(remaining_lot - lot2, 2)
-                tp2_hit       = True
-
-            if tp2_hit and bar_low <= tp3:
-                pnl3 = (entry - tp3) / pip * pv * remaining_lot
-                total_pnl += pnl3
+            # Check TP2
+            if tp1_hit and bar_low <= tp2:
+                pnl2 = (entry - tp2) / pip * pv * remaining_lot
+                total_pnl += pnl2
                 exit_bar   = entry_bar + 1 + i
-                exit_price = tp3
-                outcome    = "tp3"
+                exit_price = tp2
+                outcome    = "tp2"
                 break
 
+            # Check SL
             if bar_high >= sl:
                 exit_price = sl
                 if tp1_hit:
+                    # SL at -1R after TP1 = partial win
                     pnl_sl = (entry - sl) / pip * pv * remaining_lot
                     total_pnl += pnl_sl
-                    outcome = "sl_after_tp1" if not tp2_hit else "sl_after_tp2"
+                    outcome = "sl_after_tp1"
                 else:
+                    # Full loss
                     pnl_sl = (entry - sl) / pip * pv * lot
                     total_pnl = pnl_sl
                     outcome = "sl"
@@ -243,7 +226,7 @@ def _simulate_trade(
         "commission": round(commission, 2),
         "r_multiple": round(r_multiple, 3),
         "tp1_hit":    tp1_hit,
-        "tp2_hit":    tp2_hit,
+        "tp2_hit":    outcome == "tp2",
         "exit_price": round(exit_price, 2),
         "exit_bar":   exit_bar,
         "bars_held":  exit_bar - entry_bar,
@@ -400,7 +383,7 @@ class ScalpBacktest:
                 "stop_loss":    trade["stop_loss"],
                 "tp1":          trade["tp1"],
                 "tp2":          trade["tp2"],
-                "tp3":          trade["tp3"],
+                "tp3":          trade.get("tp3", 0),  # Keep for compatibility
                 "lot_size":     trade["lot_size"],
                 "risk_usd":     trade["risk_amount_usd"],
                 "outcome":      result["outcome"],
@@ -440,8 +423,7 @@ class ScalpBacktest:
         expectancy  = (win_rate * avg_win_r) + ((1 - win_rate) * avg_loss_r)
 
         # Max drawdown
-        equity_vals = [e[1] for e in self.params.initial_balance and [(None, initial)] or []]
-        balances    = [initial] + df["balance"].tolist()
+        balances = [initial] + df["balance"].tolist()
         peak        = initial
         max_dd      = 0.0
         max_dd_pct  = 0.0

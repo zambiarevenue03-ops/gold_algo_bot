@@ -72,14 +72,14 @@ class ScalpRiskParams:
     sl_max_distance:   float = 50.0     # Maximum SL distance ($50) — if wider, skip
 
     # Take profit R-multiples
-    tp1_r:             float = 2.0      
-    tp2_r:             float = 3.0      
-    tp3_r:             float = 3.0      
+    tp1_r:             float = 1.5      
+    tp2_r:             float = 2.5      
+    tp3_r:             float = 4.0      
 
     # Partial exit sizes (must sum to 1.0)
     tp1_pct:           float = 0.50     
-    tp2_pct:           float = 0.50     
-    tp3_pct:           float = 0.00     
+    tp2_pct:           float = 0.30     
+    tp3_pct:           float = 0.20     
 
     # Minimum R:R ratio (safety check)
     min_rr:            float = 1.5      # Don't take trades with R:R below 1.5
